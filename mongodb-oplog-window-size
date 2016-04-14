@@ -1,0 +1,43 @@
+#!/bin/bash
+#
+# MongoDB oplog window size statsd emitter
+#
+# Version 0.1
+#
+# Reports the MongoDB oplog window size in hours to a local statsd server.
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2016 Daniele Valeriani
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# Make sure to quit when running on an arbiter
+if [[ "$(mongo --quiet <<< 'rs.isMaster().arbiterOnly')" == "true" ]]; then
+  exit 0
+fi
+
+hours=$(mongo --quiet --eval "
+var ri = db.getReplicationInfo();
+var window = new Date(ri.tLast).valueOf() - new Date(ri.tFirst).valueOf();
+print(Math.floor(window / (60*60*1000)))
+")
+
+# Send the metric to localhost:8125
+[[ -n "$hours" ]] && echo -n "mongodb.oplog.window_size:${hours}|g|" >/dev/udp/localhost/8125

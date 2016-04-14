@@ -1,0 +1,203 @@
+#!/usr/bin/python
+#
+# MongoDB EBS snapshot - Takes consistent EBS snapshot of MongoDB data volumes
+#
+# Version 0.1
+#
+# Takes consistent snapshots of MongoDB data directories stored on EBS volumes.
+# Then it expires old snapshots assuming each snapshot is taken at hh:00.
+# The expiration policy is to keep 2 days of hourly snapshots, 2 weeks of daily
+# snapshots at 00:00 and one year of monthly snapshots taken at 00:00 on the
+# first day of the month.
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2016 Daniele Valeriani
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import argparse
+import boto.utils
+import logging
+import signal
+import sys
+from boto import ec2
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from pymongo import mongo_client
+
+
+OWNER_ID = 012345543210  # Insert your AWS account id here
+
+class MongoLocker(object):
+    def __init__(self, host, port, force=False):
+        try:
+            self.conn = mongo_client.MongoClient(host, int(port))
+        except:
+            logging.critical("Can't connect to mongodb on {0}:{1}. Exiting.".format(host, port))
+            sys.exit(1)
+        logging.info("Performing fsync and locking MongoDB")
+        if self.conn.is_primary and not force:
+            logging.critical("This instance is a primary. I'm not going to do anything. Exiting.")
+            sys.exit(1)
+        self.conn.fsync(lock=True)
+
+    def close(self):
+        logging.info("Unfreezing MongoDB")
+        for i in xrange(5):
+            self.conn.unlock()
+            if self.conn.is_locked:
+                logging.info("Attempt {0} failed. Retrying...".format(i))
+            else:
+                logging.info("Successfully unfreezed MongoDB.")
+                return
+        logging.error("MongoDB is still locked!")
+
+
+def round_to_minute(dt):
+    """
+    This is needed because there is a slight overhead between the start of the
+    script execution and when it gets to the expiring part.
+    """
+    seconds = (dt - dt.min).seconds
+    rounding = ((seconds + 30) // 60) * 60
+    return dt + timedelta(0, rounding - seconds, -dt.microsecond)
+
+def generate_dt_list(start, end, delta):
+    """
+    Generate a list of accepted datetimes to use as a mask for the expiration:
+    everything that doesn't fall in this list will be deleted.
+    """
+    res = []
+    curr = start
+    while curr < end:
+        res.append(curr)
+        curr += delta
+    return res
+
+now = datetime.now()
+
+# Logging
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+# Arguments parser
+parser = argparse.ArgumentParser()
+parser.add_argument("-d", "--device", dest="device_name",
+    help="Device to snapshot. default: /dev/sdd",
+    default="/dev/sdd")
+parser.add_argument("-e", "--env", dest="env",
+    help="Environment. default: prod",
+    default="prod")
+parser.add_argument("-f", "--force", dest="force", action="store_true"
+    help="Perform the lock even on a primary node. default: False",
+    default=False)
+parser.add_argument("-H", "--host", dest="mongo_host",
+    help="Mongodb host. default: localhost",
+    default="localhost")
+parser.add_argument("-n", "--name", dest="snapshot_name",
+    help="Snapshot name. default: mongodb-data_<ISO time>",
+    default="mongo_{0}".format(datetime.now().isoformat()))
+parser.add_argument("-p", "--port", dest="mongo_port",
+    help="MongoDB Port. Default: 27017",
+    default=27017)
+parser.add_argument("-r", "--region", dest="aws_region",
+    help="AWS region. default: us-east-1",
+    default="us-east-1")
+args = parser.parse_args()
+
+def exit(signum, current_stack):
+    sig_nums = dict((getattr(signal, n), n) for n in dir(signal) if n.startswith('SIG') and '_' not in n )
+    logging.error("Caught {0}. Unfreezing MongoDB and exiting.".format(sig_nums[signum]))
+    conn = mongo_client.MongoClient(args.mongo_host, int(args.mongo_port))
+    for i in xrange(5):
+        conn.unlock()
+        if conn.is_locked:
+            logging.info("Attempt {0} failed. Retrying...".format(i))
+        else:
+            logging.error("Successfully unfreezed mongo. See you next time!")
+            sys.exit(1)
+
+for sig in (
+        signal.SIGABRT,
+        signal.SIGILL,
+        signal.SIGINT,
+        signal.SIGSEGV,
+        signal.SIGTERM
+    ):
+    signal.signal(sig, exit)
+
+timestamp_format = "%Y-%m-%dT%H:%M:%S.%fZ"
+instance_id = boto.utils.get_instance_metadata()["instance-id"]
+
+# Fetch the volume id mapped to the mongodb data device
+conn = ec2.connect_to_region(args.aws_region)
+for vol in conn.get_all_volumes(filters={'attachment.instance-id': instance_id}):
+    if vol.attach_data.device == args.device_name:
+        logging.info("Detected MongoDB volume: {0}".format(vol.id))
+        mongo_vol = vol
+        break
+else:
+    logging.critical("No attached volume could be found for {0}".format(args.device_name))
+    sys.exit(1)
+
+# Fsync and freeze mongod
+mongo_locker = MongoLocker(args.mongo_host, args.mongo_port, force=args.force)
+
+# Take a snapshot
+logging.info("Taking a snapshot of {vol_id} and calling it {snap_name}".format(
+        vol_id=mongo_vol.id,
+        snap_name=args.snapshot_name
+    )
+)
+new_snap = conn.create_snapshot(mongo_vol.id, "MongoDB snapshot for {0} data".format(args.env))
+new_snap.add_tag('Name', args.snapshot_name)
+new_snap.add_tag('Env', args.env)
+
+# Now unfreeze MongoDB
+mongo_locker.close()
+
+# Get point-in-time markers
+two_days_ago = now + relativedelta(days=-2, minute=0, second=0, microsecond=0)
+two_weeks_ago = now + relativedelta(weeks=-2, hour=0, minute=0, second=0, microsecond=0)
+a_year_ago = now + relativedelta(years=-1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+# Generate a list of timetamps
+allowed_snapshots = []
+allowed_snapshots += generate_dt_list(two_days_ago, now, relativedelta(hours=1))
+allowed_snapshots += generate_dt_list(two_weeks_ago, two_days_ago, relativedelta(days=1))
+allowed_snapshots += generate_dt_list(a_year_ago, two_weeks_ago, relativedelta(months=1))
+
+# Now delete the old snapshots
+filters = {
+    "owner_id": OWNER_ID,
+    "description": "MongoDB snapshot for {0} data".format(args.env)
+}
+snapshots = conn.get_all_snapshots(filters=filters)
+deletion_counter = 0
+for snapshot in snapshots:
+    # The snapshot just taken is too close to now, so we skip it just in case
+    if snapshot.id == new_snap.id:
+        continue
+    snapshot_time = round_to_minute(datetime.strptime(snapshot.start_time, timestamp_format))
+    if snapshot_time not in allowed_snapshots:
+        logging.info("Deleting {0} - Unnamed from {1}".format(snapshot.id, snapshot.start_time))
+        deletion_counter = deletion_counter + 1
+        snapshot.delete()
+
+logging.info("Deleted {0} snapshots".format(deletion_counter))

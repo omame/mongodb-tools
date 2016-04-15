@@ -36,7 +36,7 @@ fi
 hours=$(mongo --quiet --eval "
 var ri = db.getReplicationInfo();
 var window = new Date(ri.tLast).valueOf() - new Date(ri.tFirst).valueOf();
-print(Math.floor(window / (60*60*1000)))
+print(window / (60*60*1000))
 ")
 
 # Send the metric to localhost:8125

@@ -2,7 +2,7 @@
 
 ################################################################################
 # MongoDB EBS snapshot
-# Version 0.1
+# Version 0.2
 #
 # Takes consistent snapshots of MongoDB data directories stored on EBS volumes.
 # Then it expires old snapshots assuming each snapshot is taken at hh:00.
@@ -13,41 +13,39 @@
 
 import argparse
 import boto.utils
+import fcntl
 import logging
+import os
 import signal
 import sys
 from boto import ec2
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-from pymongo import mongo_client
 
 
 OWNER_ID = 012345543210  # Insert your AWS account id here
+LOCK_FILE = "/var/lock/mongodb-ebs-snapshot.lock"
 
-class MongoLocker(object):
-    def __init__(self, host, port, force=False):
-        try:
-            self.conn = mongo_client.MongoClient(host, int(port))
-        except:
-            logging.critical("Can't connect to mongodb on {0}:{1}. Exiting.".format(host, port))
-            sys.exit(1)
-        logging.info("Performing fsync and locking MongoDB")
-        if self.conn.is_primary and not force:
-            logging.critical("This instance is a primary. I'm not going to do anything. Exiting.")
-            sys.exit(1)
-        self.conn.fsync(lock=True)
+lock_fd = open(LOCK_FILE, "w")
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    sys.exit("Another instance is running")
 
-    def close(self):
-        logging.info("Unfreezing MongoDB")
-        for i in xrange(5):
-            self.conn.unlock()
-            if self.conn.is_locked:
-                logging.info("Attempt {0} failed. Retrying...".format(i))
-            else:
-                logging.info("Successfully unfreezed MongoDB.")
-                return
-        logging.error("MongoDB is still locked!")
+def cleanup(*args):
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    # Remove the lock file
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
 
+for sig in (
+        signal.SIGABRT,
+        signal.SIGILL,
+        signal.SIGINT,
+        signal.SIGSEGV,
+        signal.SIGTERM
+    ):
+    signal.signal(sig, cleanup)
 
 def round_to_minute(dt):
     """
@@ -86,40 +84,13 @@ parser.add_argument("-e", "--env", dest="env",
 parser.add_argument("-f", "--force", dest="force", action="store_true"
     help="Perform the lock even on a primary node. default: False",
     default=False)
-parser.add_argument("-H", "--host", dest="mongo_host",
-    help="Mongodb host. default: localhost",
-    default="localhost")
 parser.add_argument("-n", "--name", dest="snapshot_name",
     help="Snapshot name. default: mongodb-data_<ISO time>",
     default="mongo_{0}".format(datetime.now().isoformat()))
-parser.add_argument("-p", "--port", dest="mongo_port",
-    help="MongoDB Port. Default: 27017",
-    default=27017)
 parser.add_argument("-r", "--region", dest="aws_region",
     help="AWS region. default: us-east-1",
     default="us-east-1")
 args = parser.parse_args()
-
-def exit(signum, current_stack):
-    sig_nums = dict((getattr(signal, n), n) for n in dir(signal) if n.startswith('SIG') and '_' not in n )
-    logging.error("Caught {0}. Unfreezing MongoDB and exiting.".format(sig_nums[signum]))
-    conn = mongo_client.MongoClient(args.mongo_host, int(args.mongo_port))
-    for i in xrange(5):
-        conn.unlock()
-        if conn.is_locked:
-            logging.info("Attempt {0} failed. Retrying...".format(i))
-        else:
-            logging.error("Successfully unfreezed mongo. See you next time!")
-            sys.exit(1)
-
-for sig in (
-        signal.SIGABRT,
-        signal.SIGILL,
-        signal.SIGINT,
-        signal.SIGSEGV,
-        signal.SIGTERM
-    ):
-    signal.signal(sig, exit)
 
 timestamp_format = "%Y-%m-%dT%H:%M:%S.%fZ"
 instance_id = boto.utils.get_instance_metadata()["instance-id"]
@@ -135,9 +106,6 @@ else:
     logging.critical("No attached volume could be found for {0}".format(args.device_name))
     sys.exit(1)
 
-# Fsync and freeze mongod
-mongo_locker = MongoLocker(args.mongo_host, args.mongo_port, force=args.force)
-
 # Take a snapshot
 logging.info("Taking a snapshot of {vol_id} and calling it {snap_name}".format(
         vol_id=mongo_vol.id,
@@ -147,9 +115,6 @@ logging.info("Taking a snapshot of {vol_id} and calling it {snap_name}".format(
 new_snap = conn.create_snapshot(mongo_vol.id, "MongoDB snapshot for {0} data".format(args.env))
 new_snap.add_tag('Name', args.snapshot_name)
 new_snap.add_tag('Env', args.env)
-
-# Now unfreeze MongoDB
-mongo_locker.close()
 
 # Get point-in-time markers
 two_days_ago = now + relativedelta(days=-2, minute=0, second=0, microsecond=0)
@@ -180,3 +145,4 @@ for snapshot in snapshots:
         snapshot.delete()
 
 logging.info("Deleted {0} snapshots".format(deletion_counter))
+cleanup()

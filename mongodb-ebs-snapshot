@@ -81,7 +81,7 @@ parser.add_argument("-d", "--device", dest="device_name",
 parser.add_argument("-e", "--env", dest="env",
     help="Environment. default: prod",
     default="prod")
-parser.add_argument("-f", "--force", dest="force", action="store_true"
+parser.add_argument("-f", "--force", dest="force", action="store_true",
     help="Perform the lock even on a primary node. default: False",
     default=False)
 parser.add_argument("-n", "--name", dest="snapshot_name",

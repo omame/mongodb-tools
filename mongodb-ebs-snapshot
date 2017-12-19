@@ -68,7 +68,7 @@ def generate_dt_list(start, end, delta):
         curr += delta
     return res
 
-now = datetime.now()
+now = datetime.utcnow()
 
 # Logging
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
